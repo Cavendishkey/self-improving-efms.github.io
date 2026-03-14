@@ -74,14 +74,6 @@ ACTION_SCALE=0.001
 DEVICE=cpu
 MAX_STEPS=200
 
-**Example `.env` file:**
-
-```env
-# Environment
-ACTION_SCALE=0.001
-DEVICE=cpu
-MAX_STEPS=200
-
 # Stage 1 (SFT)
 NUM_EXPERT_EPISODES=1000
 SFT_EPOCHS=50
@@ -96,6 +88,14 @@ RL_LR=1e-4
 RL_GAMMA=0.99
 RL_EVAL_EPISODES=50
 ```
+
+> **💡 Why `DEVICE=cpu`?**
+> This project uses very lightweight networks (2-layer MLP, dim=256) with a 6-dim input space.
+> At this scale, CPU is actually **faster** than GPU — the overhead of CPU↔GPU data transfer
+> on every step far outweighs the minimal compute benefit. This is especially true during
+> the RL stage, where the environment runs on CPU and each step requires a round-trip
+> (`CPU → GPU → inference → GPU → CPU → env.step()`).
+> Setting `DEVICE=cuda` is supported but not recommended for this project.
 
 If the `.env` file is not present, all parameters fall back to sensible default values defined in the source code.
 
