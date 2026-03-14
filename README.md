@@ -31,7 +31,11 @@ pytorch/
 │   └── reinforce.py            # REINFORCE algorithm + intrinsic rewards
 ├── train_sft.py                # Stage 1: Expert data collection + SFT training
 ├── train_rl.py                 # Stage 2: Self-improvement via RL
+├── .env                        # Hyperparameter configuration file
 ├── figure4_reproduced.png      # Output figure
+├── runs/                       # TensorBoard log directory (auto-generated)
+│   ├── sft_training/           #   Stage 1 training metrics
+│   └── rl_training/            #   Stage 2 training metrics
 └── README.md
 ```
 
@@ -44,6 +48,8 @@ pytorch/
 - NumPy
 - Matplotlib
 - dm-env
+- TensorBoard
+- python-dotenv
 
 ### Setup
 
@@ -53,8 +59,37 @@ conda create -n efm_py python=3.10
 conda activate efm_py
 
 # Install dependencies
-pip install torch numpy matplotlib dm-env
+pip install torch numpy matplotlib dm-env tensorboard python-dotenv
 ```
+
+## Configuration via `.env`
+
+All key hyperparameters can be configured through a `.env` file in the `pytorch/` directory, eliminating the need to modify source code when tuning experiments.
+
+**Example `.env` file:**
+
+```env
+# Environment
+ACTION_SCALE=0.001
+DEVICE=cpu
+MAX_STEPS=200
+
+# Stage 1 (SFT)
+NUM_EXPERT_EPISODES=1000
+SFT_EPOCHS=50
+SFT_LR=3e-4
+SFT_BATCH_SIZE=256
+SFT_EVAL_EPISODES=200
+
+# Stage 2 (RL)
+RL_ITERATIONS=100
+RL_EPISODES_PER_ITER=20
+RL_LR=1e-4
+RL_GAMMA=0.99
+RL_EVAL_EPISODES=50
+```
+
+If the `.env` file is not present, all parameters fall back to sensible default values defined in the source code.
 
 ## How to Run
 
@@ -99,6 +134,36 @@ Iter 60/100, Eval SR: 0.94, Eval Len: 33.4
 ...
 Iter 90/100, Eval SR: 0.98, Eval Len: 31.2
 ```
+
+## TensorBoard Monitoring
+
+Training metrics for both stages are automatically logged to TensorBoard. After running training, launch TensorBoard with:
+
+```bash
+tensorboard --logdir=runs --port=6007
+```
+
+Then open **http://localhost:6007** in your browser.
+
+### Available Metrics
+
+| Panel | Metric | Description |
+|---|---|---|
+| `sft/policy_loss` | Policy negative log-likelihood | Should decrease over epochs |
+| `sft/steps_loss` | StepsNet cross-entropy loss | Should decrease over epochs |
+| `sft/total_loss` | Combined loss | Overall SFT training progress |
+| `sft/learning_rate` | Cosine-annealed LR | Tracks scheduler state |
+| `train/policy_loss` | REINFORCE policy gradient loss | Per-iteration RL loss |
+| `train/success_rate` | Training rollout success rate | Per-iteration success rate |
+| `train/avg_episode_length` | Mean episode length | Should decrease as policy improves |
+| `train/avg_intrinsic_reward` | Mean intrinsic reward from StepsNet | Indicates learning progress |
+| `eval/success_rate` | Evaluation success rate (every 10 iters) | More stable metric (50 episodes) |
+| `eval/avg_length` | Evaluation average episode length | Measures efficiency |
+| `eval/length_std` | Evaluation episode length std | Measures consistency |
+
+### Sample Dashboard
+
+The TensorBoard dashboard displays real-time curves for both SFT and RL training runs side by side, enabling easy comparison of training dynamics across stages.
 
 ## Key Challenges & Solutions
 
@@ -198,6 +263,8 @@ Following the paper's approach, the StepsNet serves as a **self-supervised progr
 | Intrinsic Reward Weight | — | 0.5 |
 | Success Bonus | — | +10.0 |
 | Gradient Clip | — | 1.0 |
+
+All hyperparameters above can be overridden via the `.env` configuration file without modifying source code.
 
 ## Acknowledgments
 
