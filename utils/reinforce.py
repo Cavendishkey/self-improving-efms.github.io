@@ -1,10 +1,11 @@
 import numpy as np
 import torch
 import torch.optim as optim
+from torch.utils.tensorboard import SummaryWriter
 
 def evaluate_policy(env, policy, steps_net, num_episodes=50,
                     max_steps=200, device='cpu', action_scale=0.001):
-    """评估策略成功率"""
+    """Evaluate policy success rate"""
     policy.eval()
     successes = 0
     lengths = []
@@ -41,7 +42,7 @@ def evaluate_policy(env, policy, steps_net, num_episodes=50,
 
 def collect_rollouts(env, policy, steps_net, num_episodes=10,
                      max_steps=200, device='cpu', action_scale=0.001):
-    """收集 rollout 数据，用于 REINFORCE"""
+    """Collect rollout data for REINFORCE"""
     all_log_probs = []
     all_rewards = []
     all_intrinsic_rewards = []
@@ -64,15 +65,12 @@ def collect_rollouts(env, policy, steps_net, num_episodes=10,
 
             mean, std = policy(obs_t)
             dist = torch.distributions.Normal(mean, std)
-            # 在归一化空间采样
             scaled_action = dist.sample()
             log_prob = dist.log_prob(scaled_action).sum(dim=-1)
 
-            # 实际环境动作 = 归一化动作 × ACTION_SCALE
             action = scaled_action.squeeze(0).detach().cpu().numpy() * action_scale
             action = np.clip(action, -1.0, 1.0)
 
-            # StepsNet 预测当前状态的剩余步数
             with torch.no_grad():
                 logits_before = steps_net(obs_t)
                 d_before = torch.argmax(logits_before, dim=-1).item()
@@ -80,17 +78,13 @@ def collect_rollouts(env, policy, steps_net, num_episodes=10,
             ts = env.step(action)
             obs = ts.observation
 
-            # StepsNet 预测下一状态的剩余步数
             next_obs_vec = np.concatenate([obs['cur_pos'], obs['cur_vel'], obs['goal_pos']])
             next_obs_t = torch.tensor(next_obs_vec, dtype=torch.float32, device=device).unsqueeze(0)
             with torch.no_grad():
                 logits_after = steps_net(next_obs_t)
                 d_after = torch.argmax(logits_after, dim=-1).item()
 
-            # 内在奖励：d_before - d_after（进步越多，奖励越高）
             intrinsic_reward = float(d_before - d_after)
-
-            # 环境奖励
             env_reward = ts.reward if ts.reward is not None else 0.0
 
             ep_log_probs.append(log_prob)
@@ -99,7 +93,6 @@ def collect_rollouts(env, policy, steps_net, num_episodes=10,
 
             if env.success():
                 successes += 1
-                # 成功奖励
                 ep_rewards[-1] += 10.0
                 break
 
@@ -114,7 +107,7 @@ def collect_rollouts(env, policy, steps_net, num_episodes=10,
 
 
 def compute_returns(rewards, intrinsic_rewards, gamma=0.99, intrinsic_weight=0.5):
-    """计算带内在奖励的折扣回报"""
+    """Compute discounted returns with intrinsic rewards"""
     combined = [r + intrinsic_weight * ir for r, ir in zip(rewards, intrinsic_rewards)]
     returns = []
     G = 0
@@ -128,12 +121,13 @@ def reinforce_train(env, policy, steps_net,
                     num_iterations=100, episodes_per_iter=20,
                     lr=1e-4, gamma=0.99, device='cpu',
                     action_scale=0.001):
-    """REINFORCE + 内在奖励的自我改进训练"""
+    """REINFORCE + intrinsic reward self-improvement training"""
     optimizer = optim.Adam(policy.parameters(), lr=lr)
+    writer = SummaryWriter("runs/rl_training")
     success_rates = []
 
     for iteration in range(1, num_iterations + 1):
-        # 收集 rollout
+        # Collect rollouts
         all_log_probs, all_rewards, all_intrinsic, sr = collect_rollouts(
             env, policy, steps_net,
             num_episodes=episodes_per_iter,
@@ -141,7 +135,7 @@ def reinforce_train(env, policy, steps_net,
             action_scale=action_scale
         )
 
-        # 计算 policy loss
+        # Compute policy loss
         policy_loss = torch.tensor(0.0, device=device)
         total_episodes = 0
 
@@ -149,7 +143,6 @@ def reinforce_train(env, policy, steps_net,
             returns = compute_returns(ep_rewards, ep_intrinsic, gamma=gamma)
             returns_t = torch.tensor(returns, dtype=torch.float32, device=device)
 
-            # 标准化回报（减少方差）
             if len(returns_t) > 1:
                 returns_t = (returns_t - returns_t.mean()) / (returns_t.std() + 1e-8)
 
@@ -162,19 +155,32 @@ def reinforce_train(env, policy, steps_net,
 
         optimizer.zero_grad()
         policy_loss.backward()
-        # 梯度裁剪，防止更新过大
         torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)
         optimizer.step()
 
         success_rates.append(sr)
 
-        # 每10次迭代做一次更准确的评估
+        # ===== TensorBoard logging =====
+        writer.add_scalar("train/policy_loss", policy_loss.item(), iteration)
+        writer.add_scalar("train/success_rate", sr, iteration)
+
+        # Compute average episode length and intrinsic reward for logging
+        avg_ep_len = np.mean([len(ep) for ep in all_rewards])
+        avg_intrinsic = np.mean([np.mean(ep) for ep in all_intrinsic])
+        writer.add_scalar("train/avg_episode_length", avg_ep_len, iteration)
+        writer.add_scalar("train/avg_intrinsic_reward", avg_intrinsic, iteration)
+
+        # Every 10 iterations, do a more accurate evaluation
         if iteration % 10 == 0:
-            eval_sr, eval_len, _ = evaluate_policy(
+            eval_sr, eval_len, eval_len_std = evaluate_policy(
                 env, policy, steps_net,
                 num_episodes=50, device=device,
                 action_scale=action_scale
             )
+            writer.add_scalar("eval/success_rate", eval_sr, iteration)
+            writer.add_scalar("eval/avg_length", eval_len, iteration)
+            writer.add_scalar("eval/length_std", eval_len_std, iteration)
+
             print(f"Iter {iteration}/{num_iterations}, "
                   f"Train SR: {sr:.2f}, Eval SR: {eval_sr:.2f}, "
                   f"Eval Len: {eval_len:.1f}, Loss: {policy_loss.item():.4f}")
@@ -182,7 +188,10 @@ def reinforce_train(env, policy, steps_net,
             print(f"Iter {iteration}/{num_iterations}, "
                   f"Policy Loss: {policy_loss.item():.4f}, Success Rate: {sr:.2f}")
 
-    # 保存最终模型
+    writer.close()
+    print("TensorBoard logs saved to runs/rl_training/")
+
+    # Save final models
     torch.save(policy.state_dict(), 'policy_rl.pth')
     torch.save(steps_net.state_dict(), 'steps_net_rl.pth')
     print("Stage 2 models saved: policy_rl.pth, steps_net_rl.pth")
