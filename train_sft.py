@@ -3,16 +3,28 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.tensorboard import SummaryWriter
+from dotenv import load_dotenv
+import os
 
 from models.policy_net import PolicyNet
 from models.steps_net import StepsNet
 from env.point_mass import Point2D, pd_controller
 
-# 动作缩放因子：专家动作约 ±0.0004，除以 ACTION_SCALE 后变为 ±0.4
-ACTION_SCALE = 0.001
+# Load configuration from .env file
+load_dotenv()
+
+ACTION_SCALE = float(os.getenv("ACTION_SCALE", 0.001))
+DEVICE = os.getenv("DEVICE", "cpu")
+MAX_STEPS = int(os.getenv("MAX_STEPS", 200))
+NUM_EXPERT_EPISODES = int(os.getenv("NUM_EXPERT_EPISODES", 1000))
+SFT_EPOCHS = int(os.getenv("SFT_EPOCHS", 50))
+SFT_LR = float(os.getenv("SFT_LR", 3e-4))
+SFT_BATCH_SIZE = int(os.getenv("SFT_BATCH_SIZE", 256))
+SFT_EVAL_EPISODES = int(os.getenv("SFT_EVAL_EPISODES", 200))
 
 
-def collect_expert_data(num_episodes=1000, max_steps=200):
+def collect_expert_data(num_episodes=NUM_EXPERT_EPISODES, max_steps=MAX_STEPS):
     env = Point2D()
     all_obs = []
     all_actions = []
@@ -36,7 +48,7 @@ def collect_expert_data(num_episodes=1000, max_steps=200):
 
             obs_vec = np.concatenate([cur_pos, cur_vel, goal_pos])
             ep_obs.append(obs_vec)
-            ep_actions.append(action / ACTION_SCALE)  # 归一化
+            ep_actions.append(action / ACTION_SCALE)
 
             ts = env.step(action)
             obs = ts.observation
@@ -58,7 +70,8 @@ def collect_expert_data(num_episodes=1000, max_steps=200):
 
 
 def train_sft(obs, actions, steps_labels,
-              num_epochs=50, batch_size=256, lr=3e-4, device='cpu'):
+              num_epochs=SFT_EPOCHS, batch_size=SFT_BATCH_SIZE,
+              lr=SFT_LR, device=DEVICE):
     obs_t = torch.tensor(obs, dtype=torch.float32).to(device)
     acts_t = torch.tensor(actions, dtype=torch.float32).to(device)
 
@@ -72,6 +85,8 @@ def train_sft(obs, actions, steps_labels,
     steps_net = StepsNet().to(device)
     optimizer = optim.Adam(list(policy.parameters()) + list(steps_net.parameters()), lr=lr)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
+
+    writer = SummaryWriter("runs/sft_training")
 
     for epoch in range(num_epochs):
         total_policy_loss = 0.0
@@ -96,11 +111,23 @@ def train_sft(obs, actions, steps_labels,
 
         scheduler.step()
         n = len(loader)
+        avg_policy_loss = total_policy_loss / n
+        avg_steps_loss = total_steps_loss / n
+
+        # ===== TensorBoard logging =====
+        writer.add_scalar("sft/policy_loss", avg_policy_loss, epoch + 1)
+        writer.add_scalar("sft/steps_loss", avg_steps_loss, epoch + 1)
+        writer.add_scalar("sft/total_loss", avg_policy_loss + avg_steps_loss, epoch + 1)
+        writer.add_scalar("sft/learning_rate", scheduler.get_last_lr()[0], epoch + 1)
+
         if (epoch + 1) % 10 == 0 or epoch == 0:
             print(f"Epoch {epoch+1}/{num_epochs}, "
-                  f"Policy Loss: {total_policy_loss/n:.4f}, "
-                  f"Steps Loss: {total_steps_loss/n:.4f}, "
+                  f"Policy Loss: {avg_policy_loss:.4f}, "
+                  f"Steps Loss: {avg_steps_loss:.4f}, "
                   f"LR: {scheduler.get_last_lr()[0]:.6f}")
+
+    writer.close()
+    print("TensorBoard logs saved to runs/sft_training/")
 
     torch.save(policy.state_dict(), 'policy_sft.pth')
     torch.save(steps_net.state_dict(), 'steps_net_sft.pth')
@@ -108,7 +135,8 @@ def train_sft(obs, actions, steps_labels,
     return policy, steps_net
 
 
-def evaluate_sft(policy, num_episodes=200, max_steps=200, device='cpu'):
+def evaluate_sft(policy, num_episodes=SFT_EVAL_EPISODES,
+                 max_steps=MAX_STEPS, device=DEVICE):
     env = Point2D()
     successes = 0
     total_len = 0
@@ -145,25 +173,25 @@ def evaluate_sft(policy, num_episodes=200, max_steps=200, device='cpu'):
 
 
 def main():
-    device = 'cpu'
+    print(f"Configuration: ACTION_SCALE={ACTION_SCALE}, DEVICE={DEVICE}, "
+          f"SFT_EPOCHS={SFT_EPOCHS}, SFT_LR={SFT_LR}, SFT_BATCH_SIZE={SFT_BATCH_SIZE}")
 
     print("=" * 50)
     print("Collecting expert data...")
     print("=" * 50)
-    obs, actions, steps_labels = collect_expert_data(num_episodes=1000)
+    obs, actions, steps_labels = collect_expert_data()
     print(f"Collected {len(obs)} samples, "
           f"scaled action range: [{actions.min():.3f}, {actions.max():.3f}]")
 
     print("\n" + "=" * 50)
-    print("Training SFT (50 epochs)...")
+    print(f"Training SFT ({SFT_EPOCHS} epochs)...")
     print("=" * 50)
-    policy, steps_net = train_sft(obs, actions, steps_labels,
-                                   num_epochs=50, batch_size=256, device=device)
+    policy, steps_net = train_sft(obs, actions, steps_labels)
 
     print("\n" + "=" * 50)
     print("Evaluating SFT policy...")
     print("=" * 50)
-    sr = evaluate_sft(policy, num_episodes=200, device=device)
+    sr = evaluate_sft(policy)
 
     print(f"\n✓ Stage 1 complete! ACTION_SCALE = {ACTION_SCALE}")
 
